@@ -1,0 +1,114 @@
+@startuml cmp-bidding-internals
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+LAYOUT_TOP_DOWN()
+HIDE_STEREOTYPE()
+
+title C4 Component — Bidding Service (внутреннее устройство)
+
+Person_Ext(dsp, "DSP-партнёр", "OpenRTB bid request")
+
+Container_Ext(apiGateway, "API Gateway", "Envoy", "TLS / authn / rate limit / REST→gRPC / CB")
+ContainerDb_Ext(redis, "Redis Cluster", "Redis", "campaigns, budgets, freqcap counters, targeting indexes")
+ContainerDb_Ext(replicaPg, "Read-replica Campaign PostgreSQL", "PostgreSQL", "fallback при cache miss / CB Open на Redis")
+Container_Ext(kafka, "Kafka", "event backbone", "publish bid_won.v1; consume cdc.campaign.v1, cdc.budget.v1, delivery.impression.v1, delivery.click.v1")
+
+System_Boundary(bidding, "Bidding Service (stateless, C++ / Go)") {
+
+    Component(apiHandler, "Bid Request Handler", "grpc server", "Принимает SubmitBidRequest, оркеструет аукцион, формирует BidResponse")
+    Component(deadlineGuard, "Deadline Guard", "ctx middleware", "Пробрасывает tmax-deadline по всем шагам, fail-fast при истечении")
+
+    Component(cacheReader, "Cache Reader", "Redis client + CB", "Hot read: campaign / budget / freqcap / targeting indexes; fallback в Cold Reader при CB Open")
+    Component(coldReader, "Cold Reader", "JDBC + CB", "Чтение из read-replica Campaign PostgreSQL при cache miss или CB Open на Redis")
+
+    Component(candidateMatcher, "Candidate Matcher", "in-process", "Подбор кандидатов из кэша по таргетингу (гео, устройство, аудитория)")
+    Component(budgetChecker, "Budget Checker", "in-process", "Проверка остатка бюджета по данным кэша; отсечка кампаний при превышении")
+    Component(freqLimiter, "Frequency Limiter", "in-process", "Проверка счётчиков показов per user из Redis; пропуск при недоступности")
+    Component(auctionEngine, "Auction Engine", "in-process", "Взвешивание ставок, бизнес-правила, выбор победителя")
+    Component(responseBuilder, "Response Builder", "in-process", "Формирование Bid / NoBid response (protobuf)")
+
+    Component(eventPublisher, "Event Publisher", "Kafka producer (idempotent)", "Async publish bid_won.v1 после возврата response")
+    Component(cacheUpdater, "Cache Updater Consumer", "Kafka consumer (idempotent)", "Подписка на cdc.campaign / cdc.budget / delivery.impression / delivery.click; обновление Redis-ключей и счётчиков")
+
+    Component(observability, "Observability Hooks", "OpenTelemetry", "Metrics (latency, error rate, CB state), traces, structured logs")
+}
+
+' ====================== Hot path (bid request flow) ======================
+Rel(dsp, apiGateway, "Bid request", "HTTPS / OpenRTB")
+Rel(apiGateway, apiHandler, "Bid request", "gRPC unary")
+Rel(apiHandler, deadlineGuard, "wrap context", "ctx.WithDeadline")
+
+Rel(deadlineGuard, cacheReader, "fetch campaigns/budgets/targeting/counters", "in-process")
+Rel(cacheReader, redis, "MGET / HMGET / GET", "Redis protocol")
+Rel(cacheReader, coldReader, "on cache miss / CB Open", "in-process fallback")
+Rel(coldReader, replicaPg, "SELECT by id", "JDBC")
+
+Rel(apiHandler, candidateMatcher, "candidates", "in-process")
+Rel(apiHandler, budgetChecker, "filter by budget", "in-process")
+Rel(apiHandler, freqLimiter, "filter by freq", "in-process")
+Rel(apiHandler, auctionEngine, "eligible candidates → winner", "in-process")
+Rel(auctionEngine, responseBuilder, "winner", "in-process")
+Rel(responseBuilder, apiHandler, "BidResponse", "in-process")
+
+Rel(apiHandler, apiGateway, "BidResponse / NoBid", "gRPC unary")
+
+' ====================== Async (publish after response) ======================
+Rel(apiHandler, eventPublisher, "emit bid_won", "channel, после возврата response")
+Rel(eventPublisher, kafka, "publish bidding.bid_won.v1", "Kafka producer, acks=all")
+
+' ====================== Async (cache updates from Kafka) ======================
+Rel(kafka, cacheUpdater, "consume CDC + impression/click", "Kafka consumer")
+Rel(cacheUpdater, redis, "DEL invalidated / DECR counters", "Redis protocol")
+
+' ====================== Observability ======================
+Rel(apiHandler, observability, "spans / metrics", "OTel SDK")
+Rel(cacheReader, observability, "CB state, latency", "OTel SDK")
+Rel(coldReader, observability, "CB state, latency", "OTel SDK")
+Rel(eventPublisher, observability, "publish latency, errors", "OTel SDK")
+Rel(cacheUpdater, observability, "consumer lag, errors", "OTel SDK")
+
+' ====================== Notes ======================
+note right of deadlineGuard
+  Все шаги получают
+  ctx с общим deadline (tmax).
+  При истечении — fail-fast,
+  no-bid без ожидания.
+end note
+
+note bottom of auctionEngine
+  Hot path внутри Bidding —
+  никаких sync-вызовов
+  к внешним сервисам.
+  Все данные — из кэша / read-replica.
+end note
+
+note right of eventPublisher
+  Async-publish ПОСЛЕ
+  возврата bid response.
+  При сбое Kafka — local buffer,
+  hot path не блокируется.
+end note
+
+note right of cacheUpdater
+  Отдельный consumer вне hot path:
+  - CDC из Campaign DB → инвалидация
+  - impression/click → счётчики расходов
+  Идемпотентен по event_id.
+end note
+
+' ====================== Layout hints ======================
+Lay_D(dsp, apiGateway)
+Lay_D(apiGateway, apiHandler)
+Lay_D(apiHandler, candidateMatcher)
+Lay_R(candidateMatcher, budgetChecker)
+Lay_R(budgetChecker, freqLimiter)
+Lay_R(freqLimiter, auctionEngine)
+Lay_D(auctionEngine, responseBuilder)
+
+legend right
+  Все клиенты внешних зависимостей (Redis, Postgres) обёрнуты в Circuit Breaker.
+  В hot path запрещён retry — fail-fast в fallback (no-bid или read-replica).
+  Подробности паттернов: reliability.md
+endlegend
+
+@enduml

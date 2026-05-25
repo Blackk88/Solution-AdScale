@@ -1,0 +1,108 @@
+@startuml data-architecture-overview
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_TOP_DOWN()
+HIDE_STEREOTYPE()
+
+title AdScale — обзор хранилищ данных и владельцев (Task 3)
+
+' ====================== Сервисы ======================
+System_Boundary(hotpath, "Hot path") {
+    Container(bidding, "Bidding Service", "C++ / Go", "stateless; читает кэш и read-replica; consumer-роль для обновления кэша из событий")
+    Container(delivery, "Delivery Service", "Node.js", "stateless; публикует impression/click в Kafka")
+}
+
+System_Boundary(backoffice, "Backoffice и async-сервисы") {
+    Container(campaign, "Campaign Service", "Node.js", "CRUD кампаний — источник правды")
+    Container(financial, "Financial Service", "Go", "ACID-биллинг; consumer Kafka; интеграция с платёжным шлюзом")
+    Container(statistics, "Statistics Service", "Python", "consumer Kafka; стрим-агрегация → ClickHouse")
+    Container(analytics, "Analytics Service", "Python", "только чтение OLAP")
+}
+
+' ====================== Хранилища ======================
+ContainerDb(redis, "Redis Cluster", "Redis 7+", "Hot cache Bidding: campaigns, budgets, freqcap, targeting; sessions, rate limit, dedup")
+ContainerDb(campaignDb, "Campaign PostgreSQL", "primary + sync replica + async read-replica", "Источник правды: кампании, креативы, таргетинг, лимиты бюджетов")
+ContainerDb(financeDb, "Finance PostgreSQL", "primary + sync replica (HA)", "Балансы, billing transactions; ACID + идемпотентность по event_id")
+ContainerDb(clickhouse, "ClickHouse", "ReplicatedMergeTree", "OLAP: агрегаты impression/click, проекции из CDC")
+ContainerDb(objStorage, "Object Storage", "S3-compatible", "Креативы, backups, cold-tier Kafka")
+
+' ====================== Брокер ======================
+ContainerQueue(kafka, "Kafka", "RF=3, min.insync.replicas=2", "Event backbone: bidding.*, delivery.*, billing.*, cdc.*")
+
+' ====================== CDC ======================
+Container(debezium, "Debezium", "Kafka Connect", "CDC из Campaign PostgreSQL → Kafka")
+
+' ====================== Связи: чтение и владение ======================
+
+' Bidding читает: Redis (hot) + read-replica Campaign DB (cold)
+Rel(bidding, redis, "read-through кэш", "Redis protocol")
+Rel(bidding, campaignDb, "cache miss → read-replica", "JDBC")
+Rel(bidding, kafka, "publish bid_won.v1", "Kafka producer")
+Rel(kafka, bidding, "consume CDC + impression/click для обновления Redis", "Kafka consumer", $tags="dashed")
+
+' Delivery — events + creatives
+Rel(delivery, kafka, "publish impression/click", "Kafka producer")
+Rel(delivery, objStorage, "creatives URL", "S3 API")
+
+' Campaign Service владеет своей БД
+Rel(campaign, campaignDb, "CRUD", "JDBC primary")
+Rel(campaign, redis, "sessions, rate limit", "Redis protocol")
+
+' Financial Service — биллинг
+Rel(kafka, financial, "consume bid_won, impression", "Kafka consumer")
+Rel(financial, financeDb, "ACID writes / reads", "JDBC")
+Rel(financial, kafka, "publish billing.transaction.v1", "Kafka producer")
+
+' Statistics — стрим-агрегация
+Rel(kafka, statistics, "consume delivery.impression/click", "Kafka consumer")
+Rel(statistics, clickhouse, "write aggregates", "Native")
+
+' Analytics читает только ClickHouse
+Rel(analytics, clickhouse, "aggregate queries", "Native")
+
+' CDC поток
+Rel(debezium, campaignDb, "logical replication", "WAL")
+Rel(debezium, kafka, "publish cdc.campaign / cdc.budget / cdc.creative", "Kafka producer")
+Rel(kafka, clickhouse, "load CDC projections", "Kafka engine", $tags="dashed")
+
+' Backup
+Rel(campaignDb, objStorage, "WAL + full backup", "pgBackRest", $tags="dashed")
+Rel(financeDb, objStorage, "WAL + full backup", "pgBackRest", $tags="dashed")
+Rel(kafka, objStorage, "Tiered Storage (cold segments)", "managed", $tags="dashed")
+Rel(clickhouse, objStorage, "clickhouse-backup", "scheduled", $tags="dashed")
+
+' ====================== Заметки ======================
+note right of campaignDb
+  **Источник правды**
+  для кампаний / креативов / таргетинга.
+  Read-only доступ Bidding через
+  read-replica (без cross-service SQL).
+end note
+
+note right of financeDb
+  **Strong consistency (ACID)**
+  Изолирован от других доменов.
+  Идемпотентность через
+  уникальный индекс event_id.
+end note
+
+note right of kafka
+  **Event backbone + source of truth**
+  для проекций (Statistics, Financial,
+  cache invalidation в Bidding).
+end note
+
+legend right
+  <b>Решения per service</b>
+  Bidding: Redis + read-replica Campaign PG
+  Campaign: PostgreSQL HA
+  Statistics: consumer Kafka → ClickHouse
+  Analytics: ClickHouse (read-only)
+  Financial: dedicated PostgreSQL HA
+
+  <b>Линии</b>
+  сплошная — синхронный путь / publish-write
+  пунктирная — асинхронные потоки (CDC, consume, backup)
+endlegend
+
+@enduml

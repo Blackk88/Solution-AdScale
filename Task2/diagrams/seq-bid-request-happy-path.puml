@@ -1,0 +1,54 @@
+@startuml seq-bid-request-happy-path
+title Sequence — Bid request happy path (≤ 80 ms p95)
+
+skinparam sequenceMessageAlign center
+skinparam ParticipantPadding 12
+skinparam BoxPadding 8
+
+actor "DSP\nпартнёр" as DSP
+participant "API\nGateway" as GW
+participant "Bidding\nService" as Bid
+database "Redis\ncluster" as Redis
+queue "Kafka" as K
+
+== Аутентификация и маршрутизация (≤ 5 ms) ==
+DSP -> GW: POST /openrtb/bid\n(tmax=80)
+activate GW
+GW -> GW: mTLS + API-key\nrate limit per DSP\nset trace_id
+GW -> Bid: SubmitBidRequest\n(gRPC + ctx deadline)
+activate Bid
+
+== Чтение кэша (≤ 5 ms) ==
+Bid -> Redis: MGET campaign / budget / targeting / freqcap counters
+Redis --> Bid: cached snapshot
+
+== In-process обработка (≤ 35 ms) ==
+Bid -> Bid: candidate matching\n(подбор кандидатов из кэша)
+Bid -> Bid: budget check\n(фильтр по остатку бюджета)
+Bid -> Bid: frequency limit check\n(пропуск кампаний с превышением)
+Bid -> Bid: auction\n(взвешивание ставок, выбор победителя)
+
+== Формирование ответа ==
+Bid -> Bid: response builder\n(BidResponse в protobuf)
+Bid --> GW: BidResponse(winner, price, creative_id)
+deactivate Bid
+GW --> DSP: 200 OK\nseatbid[]
+deactivate GW
+
+== Async publish ПОСЛЕ возврата response ==
+Bid ->> K: publish bidding.bid_won.v1\n(event_id, campaign_id, price)
+
+note right of Bid
+  Hot path выполняется in-process —
+  никаких sync-вызовов к другим сервисам.
+  Все данные из Redis-кэша.
+end note
+
+note right of K
+  Idempotent producer, acks=all,
+  partitioning по campaign_id.
+  Не блокирует hot path —
+  bid response уже у партнёра.
+end note
+
+@enduml

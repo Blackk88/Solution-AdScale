@@ -1,0 +1,104 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+LAYOUT_LEFT_RIGHT()
+
+title C4 Container Diagram — AdScale (AS-IS)
+
+' ====================== Акторы ======================
+Person(advertiser, "Рекламодатель", "Управляет кампаниями, бюджетами и ставками через личный кабинет")
+Person_Ext(endUser, "Пользователь сайта/приложения", "Просматривает рекламу, кликает по баннерам")
+
+System_Ext(dspPartner, "DSP-партнёр", "Отправляет bid requests, получает bid responses по OpenRTB")
+System_Ext(paymentGateway, "Платёжный шлюз", "Обработка пополнения рекламных бюджетов")
+
+' ====================== Монолит ======================
+System_Boundary(monolith, "AdScale Monolith (C++ / Go / Python / Node.js)") {
+
+    Container(adServer, "Ad Server", "C++, Go", "Принимает HTTP-запросы, определяет пользователя, подбирает кандидатов в рекламу")
+
+    Container(auctionEngine, "Auction Engine", "C++", "Взвешивание ставок, бизнес-правила, расчёт победителя аукциона")
+
+    Container(deliveryService, "Delivery Service", "Node.js", "Формирует HTML/JS-разметку баннера и HTTP response")
+
+    Container(statsService, "Statistics Service", "Python", "Запись кликов и показов")
+
+    Container(financialService, "Financial Service", "Go", "Списание средств, выставление счетов, управление балансами")
+
+    Container(analyticsService, "Analytics Service", "Python", "Аналитические SQL-запросы по production-БД")
+
+    Container(adCabinet, "Advertiser Dashboard", "Node.js + JavaScript", "Web UI: управление кампаниями, отчётность")
+}
+
+' ====================== База данных ======================
+ContainerDb(postgres, "PostgreSQL", "PostgreSQL (одна инстанция)", "Единая БД: кампании, ставки, события, финансы, аналитика") 
+
+' ====================== Связи ======================
+
+' Внешние связи
+Rel_U(dspPartner, adServer, "Bid requests / responses", "HTTPS / OpenRTB")
+Rel_U(endUser, deliveryService, "Просмотр рекламы и клики", "HTTPS")
+Rel(advertiser, adCabinet, "Управляет кампаниями и бюджетами", "HTTPS")
+Rel(adCabinet, paymentGateway, "Пополнение бюджета", "HTTPS / REST")
+
+' Внутренние связи внутри монолита
+Rel(adServer, auctionEngine, "Передаёт кандидатов", "Internal Call")
+Rel(auctionEngine, deliveryService, "Передаёт победителя аукциона", "Internal Call")
+Rel(deliveryService, statsService, "Регистрирует показы/клики", "Internal Call")
+Rel(adCabinet, financialService, "Управление финансами", "Internal Call")
+Rel(adCabinet, analyticsService, "Запросы аналитики", "Internal Call")
+
+' Связи с БД
+Rel(auctionEngine, postgres, "Читает ставки и кампании", "JDBC / Sync")
+Rel(statsService, postgres, "Прямая запись событий", "JDBC / Direct Write")
+Rel(financialService, postgres, "Транзакции и балансы", "JDBC")
+Rel(analyticsService, postgres, "Тяжёлые аналитические запросы", "JDBC")
+Rel(adCabinet, postgres, "CRUD операций", "JDBC")
+Rel(adServer, postgres, "Чтение данных для таргетинга", "JDBC")
+
+' Принудительное расположение (layout hints)
+Lay_D(adServer, auctionEngine)
+Lay_D(auctionEngine, deliveryService)
+Lay_D(deliveryService, statsService)
+Lay_R(statsService, financialService)
+Lay_R(financialService, analyticsService)
+Lay_D(adCabinet, postgres)
+
+' ====================== Аннотации проблемных мест ======================
+
+note right of auctionEngine
+  **⚠ Критический bottleneck**
+  Синхронные вызовы к БД
+  в hot path (SLA ≤ 100 ms)
+end note
+
+note right of postgres
+  **⚠ Single Point of Failure**
+  Одна инстанция — нет HA
+  Нет read-replicas
+  OLTP + аналитика конкурируют
+end note
+
+note bottom of statsService
+  **⚠ Write bottleneck**
+  Прямая запись без буферизации / очередей
+  Конкуренция за ресурсы БД
+end note
+
+note bottom of analyticsService
+  **⚠ Блокировки и рост latency**
+  Heavy queries напрямую на production-БД
+end note
+
+' ====================== Легенда с метриками ======================
+legend right
+  <#FF0000> **15 000 RPS (пик)**
+  <#FF7700> **P95 latency: 110–120 ms** (требование ≤ 100 ms)
+  <#FF7700> Периодические деградации в часы пик
+  <#FF0000> Нет запаса по производительности
+  <#888888> Деплой: вручную, без контейнеризации
+  <#888888> Кэширование: отсутствует
+  <#888888> Асинхронные очереди: отсутствуют
+endlegend
+@enduml

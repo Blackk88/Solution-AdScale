@@ -1,0 +1,66 @@
+@startuml seq-bid-request-fallback
+title Sequence — Bid request с срабатыванием Circuit Breaker
+
+skinparam sequenceMessageAlign center
+skinparam ParticipantPadding 12
+
+actor "DSP\nпартнёр" as DSP
+participant "API\nGateway" as GW
+participant "Bidding\nService" as Bid
+database "Redis\ncluster" as Redis
+database "Read-replica\nCampaign PG" as PG
+queue "Kafka" as K
+
+== Сценарий A. Redis недоступен → fallback на read-replica ==
+
+DSP -> GW: POST /openrtb/bid (tmax=80)
+activate GW
+GW -> Bid: SubmitBidRequest
+activate Bid
+
+Bid -> Bid: Redis CB state = OPEN\n(error rate ≥ 50% за 30 с)
+note right: fail-fast,\nне ждём 5 ms timeout
+
+Bid -> PG: SELECT campaign / budget by id
+PG --> Bid: campaign data (без real-time счётчиков)
+
+Bid -> Bid: candidate matching\nbudget check (по дневному лимиту,\nбез учёта свежих расходов)\nauction
+Bid --> GW: BidResponse(winner)
+deactivate Bid
+GW --> DSP: 200 OK\nseatbid[]
+deactivate GW
+
+Bid ->> K: publish bid_won (как обычно)
+
+note right of Bid
+  Деградация Redis: read-replica в 5–10 раз медленнее.
+  Trade-off: возможна **недовыдача** трафика
+  (консервативный учёт бюджета), но не перерасход.
+  HPA скейлит Bidding на компенсацию latency.
+end note
+
+== Сценарий B. Redis + read-replica оба недоступны → no-bid ==
+
+DSP -> GW: POST /openrtb/bid (tmax=80)
+activate GW
+GW -> Bid: SubmitBidRequest
+activate Bid
+
+Bid -> Bid: Redis CB = OPEN
+Bid -> Bid: Campaign DB CB = OPEN\n(read-replica тоже недоступна)
+
+Bid -> Bid: no-bid(reason=STORAGE_UNAVAILABLE)
+Bid --> GW: BidResponse{nbr: 6}
+deactivate Bid
+GW --> DSP: 204 No Content\n(no-bid)
+deactivate GW
+
+note right of Bid
+  CB Open остаётся 5–10 секунд,
+  затем → Half-Open с пробными запросами.
+  Все успешны → Closed.
+  С точки зрения DSP — обычный no-bid,
+  не нарушение SLA.
+end note
+
+@enduml
