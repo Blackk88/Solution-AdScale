@@ -1,0 +1,117 @@
+@startuml cdc-and-event-flow
+title AdScale — потоки данных: CDC, impression, recovery
+
+skinparam sequenceMessageAlign center
+skinparam ParticipantPadding 14
+skinparam BoxPadding 8
+
+actor "Advertiser" as Adv
+participant "Campaign\nService" as Camp
+database "Campaign\nPostgreSQL" as CampDb
+participant "Debezium\n(CDC)" as Deb
+queue "Kafka" as K
+database "Redis\nCluster" as Redis
+participant "Bidding\nService" as Bid
+
+== Сценарий 1. CDC — изменение кампании ==
+
+Adv -> Camp: PUT /campaigns/123\n{ bid_ceiling_kop: ... }
+activate Camp
+Camp -> CampDb: UPDATE campaigns SET ... WHERE id=123
+CampDb --> Camp: OK
+Camp --> Adv: 200 OK
+deactivate Camp
+
+CampDb ->> Deb: WAL change (logical replication)
+activate Deb
+Deb ->> K: publish cdc.campaign.v1\n{ campaign_id: 123, before, after }
+deactivate Deb
+
+K -> Bid: consume cdc.campaign.v1
+activate Bid
+Bid -> Redis: DEL campaign:{123}
+Redis --> Bid: OK
+Bid -> K: commit offset
+deactivate Bid
+
+note right of Bid
+  Следующий cache miss
+  подтянет свежие данные read-through
+  из read-replica Campaign PostgreSQL.
+end note
+
+== Сценарий 2. Impression — fan-out на трёх consumer'ов ==
+
+actor "Пользователь" as User
+participant "Delivery\nService" as Del
+participant "Statistics\nService" as Stats
+participant "Financial\nService" as Fin
+database "ClickHouse" as CH
+database "Finance\nPostgreSQL" as FinDb
+
+User -> Del: HTTPS GET creative
+activate Del
+Del --> User: 200 OK + ad
+Del -> Del: формирует event с event_id (UUID), trace_id
+Del ->> K: publish delivery.impression.v1\n(key=campaign_id, acks=all)
+deactivate Del
+
+note right of K
+  RF=3, min.insync.replicas=2,
+  партиционирование по campaign_id.
+  Три независимые consumer-группы
+  читают одно событие.
+end note
+
+par Statistics Service
+  K -> Stats: poll delivery.impression.v1
+  activate Stats
+  Stats -> Stats: dedup by event_id\n(Redis SET NX EX)
+  Stats -> Stats: оконная агрегация (1m / 5m / 1h)
+  Stats -> CH: INSERT aggregates
+  Stats -> K: commit offset
+  deactivate Stats
+also Financial Service (биллинг)
+  K -> Fin: poll delivery.impression.v1
+  activate Fin
+  Fin -> FinDb: BEGIN\n  INSERT billing_transactions (event_id, ...)\n  ON CONFLICT (event_id) DO NOTHING\n  UPDATE wallets SET balance_kop = balance_kop - amount_kop\nCOMMIT
+  FinDb --> Fin: OK
+  Fin ->> K: publish billing.transaction.v1 (audit)
+  Fin -> K: commit offset
+  deactivate Fin
+also Bidding Service (обновление Redis-счётчиков)
+  K -> Bid: poll delivery.impression.v1
+  activate Bid
+  Bid -> Bid: dedup by event_id
+  Bid -> Redis: INCRBY budget:{campaign_id} -amount_kop
+  Bid -> Redis: INCR freqcap:{user}:{campaign}
+  Bid -> K: commit offset
+  deactivate Bid
+end
+
+note left of K
+  Replay: при сбое любого consumer
+  можно перечитать события из retention окна.
+  Idempotent Consumer защищает от двойной обработки.
+end note
+
+== Сценарий 3. Восстановление проекции из Kafka ==
+
+participant "Financial Service\n(new pod)" as FinNew
+
+note over FinNew, FinDb
+  После сбоя Financial Service:
+  под рестартует, читает с последнего
+  закоммиченного offset'а.
+end note
+
+FinNew -> K: poll from last committed offset
+K --> FinNew: события за окно lag
+FinNew -> FinDb: idempotent INSERT'ы (ON CONFLICT DO NOTHING)
+note right of FinNew
+  Дубликаты, успевшие обработаться
+  до сбоя, отклоняются по unique(event_id).
+  Двойного списания не происходит.
+end note
+
+@enduml

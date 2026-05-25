@@ -1,0 +1,73 @@
+@startuml seq-event-flow
+title Sequence — Поток impression от Delivery до трёх независимых consumer'ов
+
+skinparam sequenceMessageAlign center
+skinparam ParticipantPadding 14
+
+actor "Пользователь\n(браузер)" as User
+participant "Delivery\nService" as Del
+queue "Kafka\ntopic:\ndelivery.impression.v1" as K
+participant "Statistics\nService" as Stats
+participant "Financial\nService" as Fin
+participant "Bidding\nService\n(consumer)" as BidC
+database "ClickHouse" as CH
+database "Finance DB\n(PostgreSQL)" as FinDB
+database "Redis\ncluster" as Redis
+
+== Пользователь увидел рекламу ==
+
+User -> Del: HTTPS GET creative URL
+activate Del
+Del -> Del: render markup,\nзасчитываем impression,\nformируем event с event_id (UUID)
+Del --> User: 200 OK + creative
+
+Del ->> K: publish delivery.impression.v1\n(key=campaign_id, acks=all)
+deactivate Del
+
+note right of K
+  RF=3, min.insync.replicas=2.
+  Партиционирование по campaign_id
+  сохраняет порядок per кампания.
+  Producer: enable.idempotence=true.
+end note
+
+== Три независимых consumer-группы читают одно событие ==
+
+par Statistics Service
+  K -> Stats: poll delivery.impression.v1
+  activate Stats
+  Stats -> Stats: dedup by event_id\n(Redis SET NX EX 24h)
+  Stats -> Stats: оконная агрегация\n(1m / 5m / 1h)
+  Stats -> CH: INSERT агрегаты\n(native protocol)
+  Stats -> K: commit offset
+  deactivate Stats
+also Financial Service (биллинг)
+  K -> Fin: poll delivery.impression.v1\n(другая consumer group)
+  activate Fin
+  Fin -> FinDB: BEGIN\n  INSERT billing_transactions (event_id, ...)\n  ON CONFLICT (event_id) DO NOTHING\n  UPDATE wallets SET balance = balance - amount\nCOMMIT
+  FinDB --> Fin: OK
+  Fin -> K: commit offset
+  deactivate Fin
+also Bidding Service (обновление Redis-счётчиков)
+  K -> BidC: poll delivery.impression.v1\n(ещё одна consumer group)
+  activate BidC
+  BidC -> BidC: dedup by event_id
+  BidC -> Redis: INCRBY budget:{campaign_id} -amount\nINCR freqcap:{user}:{campaign}
+  BidC -> K: commit offset
+  deactivate BidC
+end
+
+note right of BidC
+  Каждая consumer-группа имеет
+  собственный offset и независимо
+  обрабатывает поток.
+  Сбой одного консьюмера не влияет на других.
+end note
+
+note left of K
+  Replay: при сбое любого consumer
+  можно перечитать события за окно retention (7 дней).
+  Idempotent Consumer защищает от двойной обработки.
+end note
+
+@enduml

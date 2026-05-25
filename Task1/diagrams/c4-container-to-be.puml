@@ -1,0 +1,169 @@
+@startuml c4-container-to-be
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_TOP_DOWN()
+HIDE_STEREOTYPE()
+
+title C4 Container Diagram — AdScale (TO-BE, 12 месяцев)
+
+' ====================== External ======================
+Person_Ext(dspPartner, "DSP-партнёр", "Отправляет bid request, ждёт response в ≤ 80 ms")
+Person_Ext(endUser, "Пользователь", "Видит рекламу, кликает")
+Person(advertiser, "Рекламодатель", "Управляет кампаниями, бюджетами")
+System_Ext(paymentGateway, "Платёжный шлюз", "Пополнение бюджетов рекламодателей")
+
+' ====================== Edge ======================
+System_Boundary(edge, "Edge") {
+    Container(apiGateway, "API Gateway", "Envoy / Kong / NGINX", "TLS, аутентификация, rate limiting, OpenRTB compliance, geo-routing")
+}
+
+' ====================== Bounded Contexts (каждый — отдельный микросервисный домен) ======================
+
+System_Boundary(bidding_bc, "Bidding Bounded Context") {
+    Container(biddingSvc, "Bidding Service", "C++ / Go", "Приём bid request, подбор кандидатов, взвешивание ставок, выбор победителя. SLA ≤ 80 ms p95") <<Critical Path>>
+    ContainerDb(redisCache, "Redis Cluster", "Redis 7+", "Hot cache: кампании, бюджеты, таргетинг")
+}
+
+System_Boundary(adserving_bc, "Ad Serving Bounded Context") {
+    Container(deliverySvc, "Delivery Service", "Node.js", "HTML/JS-разметка победителя, публикация impression/click")
+    ContainerDb(objStorage, "Object Storage", "S3-compatible", "Креативы, бэкапы")
+}
+
+System_Boundary(campaign_bc, "Campaign Management Bounded Context") {
+    Container(advertiserUi, "Advertiser Dashboard", "Node.js + JavaScript", "Web UI рекламодателя")
+    Container(campaignSvc, "Campaign Service", "Node.js", "CRUD кампаний, бюджетов, креативов")
+    ContainerDb(campaignDb, "Campaign PostgreSQL", "primary + read-replica", "Кампании, креативы, настройки")
+}
+
+System_Boundary(billing_bc, "Billing Bounded Context") {
+    Container(financialSvc, "Financial Service", "Go", "Consumer Kafka для биллинга, балансы, top-up через шлюз. ACID, idempotent")
+    ContainerDb(financeDb, "Finance PostgreSQL", "primary + sync replica (HA)", "Балансы, транзакции")
+}
+
+System_Boundary(analytics_bc, "Analytics Bounded Context") {
+    Container(statsSvc, "Statistics Service", "Python", "Consumer Kafka: стрим-агрегация impression/click → ClickHouse")
+    Container(analyticsSvc, "Analytics Service", "Python", "Read-only отчёты по ClickHouse")
+    ContainerDb(olap, "ClickHouse", "OLAP warehouse", "Агрегаты, исторические данные")
+}
+
+' ====================== Platform / Shared Infrastructure ======================
+System_Boundary(platform, "Platform / Shared Infrastructure") {
+    ContainerDb(kafka, "Kafka", "Apache Kafka", "Магистраль событий: impression/click, CDC. RF=3, retention 7d (30d billing)")
+    Container(kubernetes, "Kubernetes", "managed K8s", "Оркестрация, автоскейлинг, multi-AZ")
+    Container(serviceMesh, "Service Mesh", "Istio / Linkerd (12-мес фаза)", "mTLS, retries, circuit breaking east-west")
+    Container(observability, "Observability Stack", "Prometheus + Grafana + OpenTelemetry + Loki", "Метрики, traces, логи всех сервисов")
+}
+
+' =================================================================
+'                            СВЯЗИ
+' =================================================================
+
+' --- External → Edge ---
+Rel(dspPartner, apiGateway, "Bid requests / responses", "HTTPS / OpenRTB")
+Rel(endUser, apiGateway, "Просмотр рекламы, клики", "HTTPS")
+Rel(advertiser, apiGateway, "Управляет кампаниями", "HTTPS")
+
+' --- Edge → Bounded Contexts ---
+Rel(apiGateway, biddingSvc, "Bid request routing", "gRPC")
+Rel(apiGateway, deliverySvc, "Ad serving", "HTTPS")
+Rel(apiGateway, advertiserUi, "UI и API трафик рекламодателя", "HTTPS")
+
+' --- Bidding BC: внутренние и внешние ---
+Rel(biddingSvc, redisCache, "Read cache, update counters", "Redis protocol")
+Rel(biddingSvc, campaignDb, "Cache miss → read-replica", "JDBC")
+
+' --- Ad Serving BC: внутренние и публикация событий ---
+Rel(deliverySvc, objStorage, "Креативы", "S3 API")
+Rel(deliverySvc, kafka, "Publish impression/click", "Kafka producer")
+
+' --- Campaign Management BC: внутренние и публикация CDC ---
+Rel(advertiserUi, campaignSvc, "API calls", "HTTPS / REST")
+Rel(advertiserUi, analyticsSvc, "Отчёты", "REST")
+Rel(campaignSvc, campaignDb, "CRUD", "JDBC")
+Rel(campaignSvc, kafka, "CDC через Debezium", "Kafka producer")
+Rel(campaignSvc, financialSvc, "Финансовые операции", "gRPC")
+
+' --- Billing BC: внутренние и интеграция с внешним шлюзом ---
+Rel(financialSvc, financeDb, "Idempotent transactions", "JDBC")
+Rel(financialSvc, paymentGateway, "Пополнение бюджета", "HTTPS / REST")
+
+' --- Analytics BC: внутренние ---
+Rel(statsSvc, olap, "Write aggregates", "Native protocol")
+Rel(analyticsSvc, olap, "Аналитические запросы", "Native protocol")
+
+' --- Kafka → consumers (cross-BC через shared infra) ---
+Rel(kafka, statsSvc, "Subscribe impression/click", "Kafka consumer")
+Rel(kafka, financialSvc, "Subscribe billable events", "Kafka consumer")
+Rel(kafka, biddingSvc, "Subscribe CDC + events для кэша", "Kafka consumer")
+
+' =================================================================
+'                            АННОТАЦИИ
+' =================================================================
+
+note right of bidding_bc
+  **Bidding BC** — изолированный hot path,
+  единственный с SLA ≤ 80 ms p95.
+  Stateless, горизонтально масштабируется.
+end note
+
+note right of campaignDb
+  **Cross-BC чтение через read-replica**
+  Bidding (Bidding BC) читает Campaign DB
+  (Campaign Management BC) только через
+  read-replica при cache miss — не блокирует
+  hot path через Campaign API. Это HA-конфиг
+  одного логического стора, не нарушение
+  DB-per-service.
+end note
+
+note right of kafka
+  **Магистраль событий между Bounded Contexts**
+  source of truth, pub/sub, replay
+  Партиции по campaign_id / user_id
+  DLQ-топик для unprocessable
+end note
+
+' =================================================================
+'                        LAYOUT HINTS
+' =================================================================
+
+' Внешние акторы — верхняя полоса
+Lay_D(dspPartner, apiGateway)
+Lay_D(endUser, apiGateway)
+Lay_D(advertiser, apiGateway)
+
+' Edge выше всех BC
+Lay_D(apiGateway, biddingSvc)
+
+' Bounded Contexts — две колонки (BC горизонтально)
+Lay_R(biddingSvc, adserving_bc)
+Lay_D(biddingSvc, campaign_bc)
+Lay_R(campaign_bc, billing_bc)
+Lay_D(campaign_bc, analytics_bc)
+
+' Platform внизу
+Lay_D(analytics_bc, platform)
+Lay_R(kafka, kubernetes)
+Lay_R(kubernetes, serviceMesh)
+Lay_R(serviceMesh, observability)
+
+' =================================================================
+'                            ЛЕГЕНДА
+' =================================================================
+
+legend bottom right
+**Архитектурные принципы**
+====
+**Bounded Context (DDD)** — каждый блок:
+• свой Ubiquitous Language и инварианты
+• своя БД (прямого доступа извне нет)
+• независимый деплой и масштабирование
+====
+**Целевые показатели:** 50 000 RPS, P95 ≤ 80 ms, SLA 99.9 %
+**Hot path** изолирован от async через Kafka
+**Магистраль событий:** Kafka, параллельная раздача
+**DB-per-service**, разделены OLTP (Campaign, Finance) / OLAP (ClickHouse)
+**Multi-region** через гео-маршрутизацию на API Gateway
+endlegend
+
+@enduml
